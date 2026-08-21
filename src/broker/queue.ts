@@ -26,6 +26,8 @@ export interface Consumer {
   readonly noAck: boolean;
   readonly exclusive: boolean;
   deliver(message: Message, queue: Queue): boolean;
+  /** The queue is going away — notify the client (server-sent basic.cancel). */
+  cancel(): void;
 }
 
 export interface QueueProperties {
@@ -169,6 +171,12 @@ export class Queue {
     this.consumers.splice(i, 1);
     if (this.rrIndex > i) this.rrIndex--;
     return true;
+  }
+
+  /** Detach every consumer, letting each notify its client. */
+  cancelAllConsumers(): void {
+    for (const consumer of this.consumers.splice(0)) consumer.cancel();
+    this.rrIndex = 0;
   }
 
   /** Auto-delete queues go away when their last consumer is cancelled. */

@@ -61,8 +61,11 @@ serves AMQP over any duplex stream.
   dead-lettering (`x-dead-letter-exchange`/`x-dead-letter-routing-key`) on
   reject/nack without requeue and on expiry, with RabbitMQ-style `x-death` /
   `x-first-death-*` headers
-- RabbitMQ-style error semantics: channel 404/406/403/405/530,
-  connection 501/503/504/505
+- Server-sent `basic.cancel` when a consumed queue is deleted
+  (`consumer_cancel_notify`)
+- RabbitMQ-style error semantics: channel 404/406/403/405/530/540,
+  connection 501/503/504/505; unsupported methods (e.g. `exchange.bind`)
+  fail their channel with 540 rather than the whole connection
 
 ## Not supported
 
