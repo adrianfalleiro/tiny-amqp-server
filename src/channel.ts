@@ -180,11 +180,16 @@ export class Channel {
       case methods.ChannelFlow:
         throw new ChannelError(constants.NOT_IMPLEMENTED, `${methodName(id)} is not supported`, id);
       default:
-        throw new ConnectionError(
-          constants.COMMAND_INVALID,
-          `unexpected method ${methodName(id)} on channel ${this.channelNumber}`,
-          id,
-        );
+        // Connection-class traffic on a data channel is a protocol violation;
+        // anything else unsupported (exchange.bind, ...) fails just this channel
+        if (classIdOf(id) === 10) {
+          throw new ConnectionError(
+            constants.COMMAND_INVALID,
+            `unexpected method ${methodName(id)} on channel ${this.channelNumber}`,
+            id,
+          );
+        }
+        throw new ChannelError(constants.NOT_IMPLEMENTED, `${methodName(id)} is not supported`, id);
     }
   }
 
@@ -398,6 +403,7 @@ export class Channel {
       noAck,
       exclusive: !!f.exclusive,
       deliver: (message, fromQueue) => this.deliverToConsumer(consumerTag, noAck, message, fromQueue),
+      cancel: () => this.consumerCancelledByServer(consumerTag),
     });
   }
 
@@ -428,6 +434,14 @@ export class Channel {
     let n = 0;
     for (const entry of this.unacked.values()) if (entry.fromConsumer) n++;
     return n;
+  }
+
+  /** The queue vanished from under this consumer — send basic.cancel. */
+  private consumerCancelledByServer(consumerTag: string): void {
+    if (!this.consumerQueues.delete(consumerTag)) return;
+    if (this.state === 'open') {
+      this.send(methods.BasicCancel, { consumerTag, nowait: true });
+    }
   }
 
   private basicCancel(f: MethodFields): void {

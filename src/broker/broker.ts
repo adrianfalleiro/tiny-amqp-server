@@ -197,6 +197,7 @@ export class Broker {
 
   /** Remove a queue and all its bindings; returns the dropped message count. */
   removeQueue(queue: Queue): number {
+    queue.cancelAllConsumers();
     for (const exchange of this.exchanges.values()) {
       exchange.removeBindingsFor(queue.name);
     }

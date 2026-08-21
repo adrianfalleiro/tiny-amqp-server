@@ -391,6 +391,35 @@ describe('error semantics', () => {
     expect(server.broker.queues.has('mine')).toBe(false);
   });
 
+  it('sends basic.cancel to consumers when their queue is deleted', async () => {
+    const connection = await connect();
+    const consumerChannel = await connection.createChannel();
+    await consumerChannel.assertQueue('doomed');
+    // amqplib surfaces a server-sent basic.cancel as a null message
+    const cancelled = new Promise<boolean>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no cancel notification')), 2000);
+      consumerChannel.consume('doomed', (msg) => {
+        if (msg === null) {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      });
+    });
+    const admin = await connection.createChannel();
+    await admin.deleteQueue('doomed');
+    expect(await cancelled).toBe(true);
+  });
+
+  it('rejects exchange-to-exchange bindings with 540 but keeps the connection alive', async () => {
+    const connection = await connect();
+    const doomed = await connection.createChannel();
+    doomed.on('error', () => {});
+    await expect(doomed.bindExchange('dest-x', 'src-x', 'key')).rejects.toThrow(/540/);
+    const fresh = await connection.createChannel();
+    await fresh.assertQueue('survives-540');
+    expect(server.broker.queues.has('survives-540')).toBe(true);
+  });
+
   it('reports queue counts on purge', async () => {
     const channel = await (await connect()).createChannel();
     await channel.assertQueue('heap');

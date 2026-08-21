@@ -109,7 +109,7 @@ export class AmqpConnection implements ChannelHost {
             publisher_confirms: true,
             basic_nack: true,
             'basic.nack': true,
-            consumer_cancel_notify: false,
+            consumer_cancel_notify: true,
             exchange_exchange_bindings: false,
           },
           ...this.options.serverProperties,
