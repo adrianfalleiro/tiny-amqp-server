@@ -23,6 +23,8 @@ export interface ChannelHost {
   readonly connectionId: string;
   readonly broker: Broker;
   readonly frameMax: number;
+  /** True while the socket's write buffer is full — hold new deliveries. */
+  readonly sendBlocked: boolean;
   send(buf: Buffer): void;
   /** Remove the channel from the connection's table once fully closed. */
   channelClosed(channelNumber: number): void;
@@ -341,9 +343,11 @@ export class Channel {
       body: Buffer.concat(pending.chunks),
       redelivered: false,
     };
+    let accepted = true;
     try {
-      const routed = this.broker.publish(message.exchange, message.routingKey, message);
-      if (routed.length === 0 && f.mandatory) {
+      const result = this.broker.publish(message.exchange, message.routingKey, message);
+      accepted = result.accepted;
+      if (result.routed.length === 0 && f.mandatory) {
         this.send(methods.BasicReturn, {
           replyCode: constants.NO_ROUTE,
           replyText: 'NO_ROUTE',
@@ -360,7 +364,14 @@ export class Channel {
       throw err;
     }
     if (this.confirmMode) {
-      this.send(methods.BasicAck, { deliveryTag: pending.confirmSeq, multiple: false });
+      // A queue refusing the message (x-overflow: reject-publish) surfaces
+      // to the publisher as a nack, as in RabbitMQ
+      this.send(
+        accepted ? methods.BasicAck : methods.BasicNack,
+        accepted
+          ? { deliveryTag: pending.confirmSeq, multiple: false }
+          : { deliveryTag: pending.confirmSeq, multiple: false, requeue: false },
+      );
     }
   }
 
@@ -414,6 +425,7 @@ export class Channel {
     queue: Queue,
   ): boolean {
     if (this.state !== 'open') return false;
+    if (this.host.sendBlocked) return false; // socket backed up — queue keeps it
     if (!noAck && this.prefetchCount > 0 && this.unackedConsumeCount() >= this.prefetchCount) {
       return false;
     }
@@ -555,6 +567,11 @@ export class Channel {
   /** Prefetch capacity may have freed up — let our queues try to deliver. */
   private drainConsumerQueues(): void {
     for (const queue of new Set(this.consumerQueues.values())) queue.drain();
+  }
+
+  /** The connection's write buffer drained — resume paused deliveries. */
+  onWritable(): void {
+    this.drainConsumerQueues();
   }
 
   // ---------------------------------------------------------------- teardown

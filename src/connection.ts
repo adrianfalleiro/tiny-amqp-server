@@ -52,6 +52,7 @@ export class AmqpConnection implements ChannelHost {
   heartbeatSeconds = 0;
 
   private state: ConnectionState = 'awaiting-protocol-header';
+  private writeBlocked = false;
   private rest: Buffer = Buffer.alloc(0);
   private readonly channels = new Map<number, Channel>();
   private heart: Heart | null = null;
@@ -71,10 +72,24 @@ export class AmqpConnection implements ChannelHost {
 
   // ------------------------------------------------------------- ChannelHost
 
+  get sendBlocked(): boolean {
+    return this.writeBlocked;
+  }
+
   send(buf: Buffer): void {
     if (this.state === 'closed' || this.socket.destroyed) return;
     this.sentSinceCheck = true;
-    this.socket.write(buf);
+    const flushed = this.socket.write(buf);
+    // Backpressure: pause new deliveries while the kernel buffer is full.
+    // In-flight frame sequences still complete (writes are never dropped) —
+    // only Channel#deliverToConsumer consults sendBlocked before starting.
+    if (!flushed && !this.writeBlocked) {
+      this.writeBlocked = true;
+      this.socket.once('drain', () => {
+        this.writeBlocked = false;
+        for (const channel of this.channels.values()) channel.onWritable();
+      });
+    }
   }
 
   channelClosed(channelNumber: number): void {
