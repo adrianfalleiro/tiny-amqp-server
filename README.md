@@ -59,8 +59,16 @@ serves AMQP over any duplex stream.
 - Publisher confirms (`confirm.select`) and `mandatory` → `basic.return`
 - Message TTL (`x-message-ttl` and per-message `expiration`, min wins) and
   dead-lettering (`x-dead-letter-exchange`/`x-dead-letter-routing-key`) on
-  reject/nack without requeue and on expiry, with RabbitMQ-style `x-death` /
-  `x-first-death-*` headers
+  reject/nack without requeue, expiry, and length-limit overflow, with
+  RabbitMQ-style `x-death` / `x-first-death-*` headers and automatic-cycle
+  detection (retry loops that include a rejection still work)
+- Queue lifetimes and limits: `x-expires` (idle queues are deleted),
+  `x-max-length`/`x-max-length-bytes` with `x-overflow` `drop-head`
+  (default, dead-letters the oldest) or `reject-publish` (publisher nack)
+- Declare equivalence: redeclaring a queue/exchange with different
+  properties **or arguments** fails with 406, like RabbitMQ
+- Outbound backpressure: deliveries pause while the client socket's write
+  buffer is full and resume on drain
 - Server-sent `basic.cancel` when a consumed queue is deleted
   (`consumer_cancel_notify`)
 - RabbitMQ-style error semantics: channel 404/406/403/405/530/540,
@@ -71,8 +79,7 @@ serves AMQP over any duplex stream.
 
 Durability/persistence (everything is in memory), TLS, real authentication,
 transactions (`tx.*`), `channel.flow`, exchange-to-exchange bindings, headers
-exchanges, queue TTL (`x-expires`), `x-max-length`, dead-letter cycle
-detection.
+exchanges, priority queues (`x-max-priority`).
 
 ## Development
 

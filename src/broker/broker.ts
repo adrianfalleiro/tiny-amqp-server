@@ -54,7 +54,12 @@ export class Broker {
     }
     if (existing) {
       const p = existing.properties;
-      if (p.type !== type || p.durable !== opts.durable || p.autoDelete !== opts.autoDelete) {
+      if (
+        p.type !== type ||
+        p.durable !== opts.durable ||
+        p.autoDelete !== opts.autoDelete ||
+        !deepEqual(p.arguments ?? {}, opts.arguments ?? {})
+      ) {
         throw new ChannelError(
           constants.PRECONDITION_FAILED,
           `inequivalent arg for exchange '${name}': received declaration differs from existing`,
@@ -100,7 +105,8 @@ export class Broker {
           if (
             p.durable !== opts.durable ||
             p.exclusive !== opts.exclusive ||
-            p.autoDelete !== opts.autoDelete
+            p.autoDelete !== opts.autoDelete ||
+            !deepEqual(p.arguments ?? {}, opts.arguments ?? {})
           ) {
             throw new ChannelError(
               constants.PRECONDITION_FAILED,
@@ -108,6 +114,7 @@ export class Broker {
             );
           }
         }
+        existing.touchUsage(); // a redeclare counts as use for x-expires
         return existing;
       }
       if (opts.passive) {
@@ -133,7 +140,12 @@ export class Broker {
         arguments: opts.arguments,
       },
       opts.exclusive ? connectionId : null,
-      (source, message, reason) => this.deadLetter(source, message, reason),
+      {
+        deadLetter: (source, message, reason) => this.deadLetter(source, message, reason),
+        expireQueue: (idle) => {
+          if (this.queues.get(idle.name) === idle) this.removeQueue(idle);
+        },
+      },
     );
     this.queues.set(queueName, queue);
     return queue;
@@ -197,6 +209,7 @@ export class Broker {
 
   /** Remove a queue and all its bindings; returns the dropped message count. */
   removeQueue(queue: Queue): number {
+    queue.dispose();
     queue.cancelAllConsumers();
     for (const exchange of this.exchanges.values()) {
       exchange.removeBindingsFor(queue.name);
@@ -212,21 +225,28 @@ export class Broker {
   }
 
   /**
-   * Route a message. @returns the queues it was delivered to (possibly none).
+   * Route a message. `routed` lists the matched queues (for mandatory
+   * handling); `accepted` is false when any of them refused it
+   * (x-overflow: reject-publish), which a confirm channel reports as a nack.
    * The default exchange routes directly to the queue named by the routing key.
    */
-  publish(exchangeName: string, routingKey: string, message: Message): Queue[] {
+  publish(
+    exchangeName: string,
+    routingKey: string,
+    message: Message,
+  ): { routed: Queue[]; accepted: boolean } {
     const exchange = this.exchanges.get(exchangeName);
     if (!exchange) {
       throw new ChannelError(constants.NOT_FOUND, `no exchange '${exchangeName}' in vhost '/'`);
     }
-    const targets = this.resolveTargets(exchange, routingKey);
-    for (const queue of targets) {
+    const routed = this.resolveTargets(exchange, routingKey);
+    let accepted = true;
+    for (const queue of routed) {
       // Each queue gets its own message instance so redelivered flags and
       // requeues on one queue don't leak into another
-      queue.publish({ ...message });
+      if (!queue.publish({ ...message })) accepted = false;
     }
-    return targets;
+    return { routed, accepted };
   }
 
   private resolveTargets(exchange: Exchange, routingKey: string): Queue[] {
@@ -257,7 +277,19 @@ export class Broker {
     if (!exchange) return;
     const routingKey = source.deadLetterRoutingKey ?? message.routingKey;
     const dead = buildDeadLetteredMessage(message, source.name, reason, exchangeName, routingKey);
+    // Cycle detection, as in RabbitMQ: a message returning to a queue it has
+    // already died from is dropped if the whole chain was automatic (no
+    // explicit rejection anywhere in its history)
+    const deaths = (dead.properties.headers as MethodFields)['x-death'] as Array<{
+      queue: string;
+      reason: string;
+    }>;
+    const automaticOnly = deaths.every((d) => d.reason !== 'rejected');
     for (const queue of this.resolveTargets(exchange, routingKey)) {
+      // The target queue appearing in the history means a cycle; a rejection
+      // anywhere in the chain (client intervention) permits it to continue —
+      // that's the retry-queue pattern — otherwise the message is dropped
+      if (automaticOnly && deaths.some((d) => d.queue === queue.name)) continue;
       queue.publish({ ...dead });
     }
   }
@@ -277,6 +309,24 @@ interface DeathEntry extends Record<string, unknown> {
   reason: DeadLetterReason;
   queue: string;
   exchange: string;
+}
+
+/** Structural equality for AMQP field tables (declare-equivalence checks). */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Buffer.isBuffer(a) && Buffer.isBuffer(b)) return a.equals(b);
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, i) => deepEqual(value, b[i]));
+  }
+  if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((key) =>
+      deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]),
+    );
+  }
+  return false;
 }
 
 /** RabbitMQ encodes x-death times as AMQP timestamps (seconds). */

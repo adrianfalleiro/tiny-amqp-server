@@ -359,6 +359,87 @@ describe('dead-lettering and TTL', () => {
   });
 });
 
+describe('queue limits and lifetimes', () => {
+  it('deletes an idle x-expires queue but keeps a consumed one', async () => {
+    const channel = await (await connect()).createChannel();
+    await channel.assertQueue('lease-idle', { expires: 100 });
+    await channel.assertQueue('lease-used', { expires: 100 });
+    await channel.consume('lease-used', () => {}, { noAck: true });
+    await wait(300);
+    expect(server.broker.queues.has('lease-idle')).toBe(false);
+    expect(server.broker.queues.has('lease-used')).toBe(true);
+  });
+
+  it('drops the head to the DLX when x-max-length is exceeded', async () => {
+    const channel = await (await connect()).createChannel();
+    await channel.assertExchange('cap-x', 'fanout');
+    await channel.assertQueue('cap-dlq');
+    await channel.bindQueue('cap-dlq', 'cap-x', '');
+    await channel.assertQueue('cap', { maxLength: 2, deadLetterExchange: 'cap-x' });
+    for (const body of ['a', 'b', 'c']) channel.sendToQueue('cap', Buffer.from(body));
+    await wait(30);
+    expect(server.broker.queues.get('cap')!.messageCount).toBe(2);
+    const dropped = (await channel.get('cap-dlq', { noAck: true })) as ConsumeMessage;
+    expect(dropped.content.toString()).toBe('a'); // oldest goes first
+    expect(dropped.properties.headers!['x-death']).toMatchObject([
+      { reason: 'maxlen', queue: 'cap' },
+    ]);
+    const next = (await channel.get('cap', { noAck: true })) as ConsumeMessage;
+    expect(next.content.toString()).toBe('b');
+  });
+
+  it('nacks the publisher when x-overflow is reject-publish', async () => {
+    const channel = await (await connect()).createConfirmChannel();
+    await channel.assertQueue('full', { maxLength: 1, overflow: 'reject-publish' } as never);
+    const confirm = (body: string) =>
+      new Promise<Error | null>((resolve) =>
+        channel.sendToQueue('full', Buffer.from(body), {}, (err) => resolve(err)),
+      );
+    expect(await confirm('fits')).toBeNull();
+    expect(await confirm('overflows')).toBeTruthy(); // server basic.nack
+    expect(server.broker.queues.get('full')!.messageCount).toBe(1);
+  });
+
+  it('drops messages caught in a fully-automatic dead-letter cycle', async () => {
+    const channel = await (await connect()).createChannel();
+    // TTL queue whose DLX routes straight back to itself: without cycle
+    // detection this would spin forever
+    await channel.assertQueue('spin', {
+      messageTtl: 60,
+      deadLetterExchange: '',
+      deadLetterRoutingKey: 'spin',
+    });
+    channel.sendToQueue('spin', Buffer.from('dizzy'));
+    await wait(250);
+    expect(server.broker.queues.get('spin')!.messageCount).toBe(0);
+  });
+
+  it('allows retry cycles that include a rejection (retry-queue pattern)', async () => {
+    const channel = await (await connect()).createChannel();
+    await channel.assertExchange('retry-x', 'fanout');
+    await channel.assertQueue('retry-q', {
+      messageTtl: 60,
+      deadLetterExchange: '',
+      deadLetterRoutingKey: 'work2',
+    });
+    await channel.bindQueue('retry-q', 'retry-x', '');
+    await channel.assertQueue('work2', { deadLetterExchange: 'retry-x' });
+
+    channel.sendToQueue('work2', Buffer.from('flaky-job'));
+    await wait(20);
+    const attempt = (await channel.get('work2', { noAck: false })) as ConsumeMessage;
+    channel.reject(attempt, false); // → retry-q, expires there → back to work2
+    await wait(250);
+    const retried = (await channel.get('work2', { noAck: true })) as ConsumeMessage;
+    expect(retried).not.toBe(false);
+    expect(retried.content.toString()).toBe('flaky-job');
+    const deaths = retried.properties.headers!['x-death'] as Array<Record<string, unknown>>;
+    expect(deaths).toHaveLength(2);
+    expect(deaths[0]).toMatchObject({ reason: 'expired', queue: 'retry-q' });
+    expect(deaths[1]).toMatchObject({ reason: 'rejected', queue: 'work2' });
+  });
+});
+
 describe('error semantics', () => {
   it('fails a passive declare of a missing queue with 404 and keeps the connection alive', async () => {
     const connection = await connect();
@@ -378,6 +459,16 @@ describe('error semantics', () => {
     const second = await connection.createChannel();
     second.on('error', () => {}); // amqplib also emits the server close as an event
     await expect(second.assertQueue('props', { durable: true })).rejects.toThrow(/406/);
+  });
+
+  it('fails a redeclare with different arguments with 406', async () => {
+    const connection = await connect();
+    const first = await connection.createChannel();
+    await first.assertQueue('argq', { messageTtl: 1000 });
+    await first.assertQueue('argq', { messageTtl: 1000 }); // identical is fine
+    const second = await connection.createChannel();
+    second.on('error', () => {});
+    await expect(second.assertQueue('argq', { messageTtl: 2000 })).rejects.toThrow(/406/);
   });
 
   it('deletes exclusive queues when their connection closes', async () => {
