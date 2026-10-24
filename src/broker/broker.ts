@@ -25,7 +25,13 @@ export class Broker {
     for (const [name, type] of defaults) {
       this.exchanges.set(
         name,
-        new Exchange(name, { type, durable: true, autoDelete: false, internal: false, arguments: {} }),
+        new Exchange(name, {
+          type,
+          durable: true,
+          autoDelete: false,
+          internal: false,
+          arguments: {},
+        }),
       );
     }
   }
@@ -33,7 +39,13 @@ export class Broker {
   assertExchange(
     name: string,
     type: string,
-    opts: { passive: boolean; durable: boolean; autoDelete: boolean; internal: boolean; arguments: MethodFields },
+    opts: {
+      passive: boolean;
+      durable: boolean;
+      autoDelete: boolean;
+      internal: boolean;
+      arguments: MethodFields;
+    },
   ): Exchange {
     const existing = this.exchanges.get(name);
     if (opts.passive) {
@@ -42,13 +54,18 @@ export class Broker {
       }
       return existing;
     }
-    if (name === '' || name.startsWith(AMQP_RESERVED_PREFIX)) {
+    if (name === '' || (!existing && name.startsWith(AMQP_RESERVED_PREFIX))) {
       throw new ChannelError(
         constants.ACCESS_REFUSED,
         `exchange name '${name}' contains reserved prefix '${AMQP_RESERVED_PREFIX}'`,
       );
     }
-    if (type !== 'direct' && type !== 'fanout' && type !== 'topic' && type !== 'x-consistent-hash') {
+    if (
+      type !== 'direct' &&
+      type !== 'fanout' &&
+      type !== 'topic' &&
+      type !== 'x-consistent-hash'
+    ) {
       // Mirrors RabbitMQ: an unknown exchange type is a connection error
       throw new ConnectionError(constants.COMMAND_INVALID, `unknown exchange type '${type}'`);
     }
@@ -56,6 +73,7 @@ export class Broker {
       const p = existing.properties;
       if (
         p.type !== type ||
+        p.internal !== opts.internal ||
         p.durable !== opts.durable ||
         p.autoDelete !== opts.autoDelete ||
         !deepEqual(p.arguments ?? {}, opts.arguments ?? {})
@@ -93,7 +111,13 @@ export class Broker {
 
   assertQueue(
     name: string,
-    opts: { passive: boolean; durable: boolean; exclusive: boolean; autoDelete: boolean; arguments: MethodFields },
+    opts: {
+      passive: boolean;
+      durable: boolean;
+      exclusive: boolean;
+      autoDelete: boolean;
+      arguments: MethodFields;
+    },
     connectionId: string,
   ): Queue {
     if (name !== '') {
@@ -170,7 +194,13 @@ export class Broker {
     }
   }
 
-  bindQueue(queueName: string, exchangeName: string, bindingKey: string, args: MethodFields, connectionId: string): void {
+  bindQueue(
+    queueName: string,
+    exchangeName: string,
+    bindingKey: string,
+    args: MethodFields,
+    connectionId: string,
+  ): void {
     const queue = this.getQueue(queueName, connectionId);
     const exchange = this.exchanges.get(exchangeName);
     if (!exchange) {
@@ -182,7 +212,12 @@ export class Broker {
     exchange.bind(queue.name, bindingKey, args);
   }
 
-  unbindQueue(queueName: string, exchangeName: string, bindingKey: string, connectionId: string): void {
+  unbindQueue(
+    queueName: string,
+    exchangeName: string,
+    bindingKey: string,
+    connectionId: string,
+  ): void {
     const queue = this.getQueue(queueName, connectionId);
     const exchange = this.exchanges.get(exchangeName);
     // Unbinding something that isn't bound is a no-op success
@@ -193,7 +228,11 @@ export class Broker {
     return this.getQueue(name, connectionId).purge();
   }
 
-  deleteQueue(name: string, opts: { ifUnused: boolean; ifEmpty: boolean }, connectionId: string): number {
+  deleteQueue(
+    name: string,
+    opts: { ifUnused: boolean; ifEmpty: boolean },
+    connectionId: string,
+  ): number {
     const queue = this.queues.get(name);
     // Deleting a missing queue succeeds with zero messages (RabbitMQ behaviour)
     if (!queue) return 0;
@@ -238,6 +277,12 @@ export class Broker {
     const exchange = this.exchanges.get(exchangeName);
     if (!exchange) {
       throw new ChannelError(constants.NOT_FOUND, `no exchange '${exchangeName}' in vhost '/'`);
+    }
+    if (exchange.properties.internal) {
+      throw new ChannelError(
+        constants.ACCESS_REFUSED,
+        `cannot publish to internal exchange '${exchangeName}'`,
+      );
     }
     const routed = this.resolveTargets(exchange, routingKey);
     let accepted = true;

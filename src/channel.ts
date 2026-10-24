@@ -43,7 +43,7 @@ interface UnackedEntry {
   message: Message;
   queue: Queue;
   /** Consumer deliveries count toward the prefetch window; basic.get does not. */
-  fromConsumer: boolean;
+  consumer?: object;
 }
 
 type ChannelState = 'open' | 'closing-by-server' | 'closed';
@@ -51,6 +51,7 @@ type ChannelState = 'open' | 'closing-by-server' | 'closed';
 export class Channel {
   private state: ChannelState = 'open';
   private prefetchCount = 0;
+  private globalPrefetchCount = 0;
   private confirmMode = false;
   private publishSeq = 0;
   private deliveryTagCounter = 0;
@@ -81,7 +82,10 @@ export class Channel {
     const maxBody = this.host.frameMax - FRAME_OVERHEAD;
     for (let offset = 0; offset < body.length; offset += maxBody) {
       this.host.send(
-        makeBodyFrame(this.channelNumber, body.subarray(offset, Math.min(offset + maxBody, body.length))),
+        makeBodyFrame(
+          this.channelNumber,
+          body.subarray(offset, Math.min(offset + maxBody, body.length)),
+        ),
       );
     }
   }
@@ -378,7 +382,9 @@ export class Channel {
   // ---------------------------------------------------------------- consume
 
   private basicQos(f: MethodFields): void {
-    this.prefetchCount = (f.prefetchCount as number) ?? 0;
+    const count = (f.prefetchCount as number) ?? 0;
+    if (f.global) this.globalPrefetchCount = count;
+    else this.prefetchCount = count;
     this.send(methods.BasicQosOk, {});
     this.drainConsumerQueues();
   }
@@ -394,26 +400,24 @@ export class Channel {
       throw new ChannelError(constants.NOT_ALLOWED, `consumer tag '${consumerTag}' already in use`);
     }
     if (f.exclusive && queue.consumerCount > 0) {
-      throw new ChannelError(
-        constants.ACCESS_REFUSED,
-        `queue '${queue.name}' in exclusive use`,
-      );
+      throw new ChannelError(constants.ACCESS_REFUSED, `queue '${queue.name}' in exclusive use`);
     }
     if (queue.hasExclusiveConsumer) {
-      throw new ChannelError(
-        constants.ACCESS_REFUSED,
-        `queue '${queue.name}' in exclusive use`,
-      );
+      throw new ChannelError(constants.ACCESS_REFUSED, `queue '${queue.name}' in exclusive use`);
     }
     const noAck = !!f.noAck;
+    const consumer = {};
+    const prefetchCount = this.prefetchCount;
     if (!f.nowait) this.send(methods.BasicConsumeOk, { consumerTag });
     this.consumerQueues.set(consumerTag, queue);
     // Registering triggers delivery of buffered messages, so ConsumeOk went first
     queue.addConsumer({
       consumerTag,
+      owner: this,
       noAck,
       exclusive: !!f.exclusive,
-      deliver: (message, fromQueue) => this.deliverToConsumer(consumerTag, noAck, message, fromQueue),
+      deliver: (message, fromQueue) =>
+        this.deliverToConsumer(consumerTag, noAck, message, fromQueue, consumer, prefetchCount),
       cancel: () => this.consumerCancelledByServer(consumerTag),
     });
   }
@@ -423,14 +427,20 @@ export class Channel {
     noAck: boolean,
     message: Message,
     queue: Queue,
+    consumer: object,
+    prefetchCount: number,
   ): boolean {
     if (this.state !== 'open') return false;
     if (this.host.sendBlocked) return false; // socket backed up — queue keeps it
-    if (!noAck && this.prefetchCount > 0 && this.unackedConsumeCount() >= this.prefetchCount) {
+    if (
+      !noAck &&
+      ((prefetchCount > 0 && this.unackedConsumeCount(consumer) >= prefetchCount) ||
+        (this.globalPrefetchCount > 0 && this.unackedConsumeCount() >= this.globalPrefetchCount))
+    ) {
       return false;
     }
     const deliveryTag = ++this.deliveryTagCounter;
-    if (!noAck) this.unacked.set(deliveryTag, { message, queue, fromConsumer: true });
+    if (!noAck) this.unacked.set(deliveryTag, { message, queue, consumer });
     this.send(methods.BasicDeliver, {
       consumerTag,
       deliveryTag,
@@ -442,9 +452,11 @@ export class Channel {
     return true;
   }
 
-  private unackedConsumeCount(): number {
+  private unackedConsumeCount(consumer?: object): number {
     let n = 0;
-    for (const entry of this.unacked.values()) if (entry.fromConsumer) n++;
+    for (const entry of this.unacked.values()) {
+      if (entry.consumer && (consumer === undefined || entry.consumer === consumer)) n++;
+    }
     return n;
   }
 
@@ -461,7 +473,7 @@ export class Channel {
     const queue = this.consumerQueues.get(consumerTag);
     if (queue) {
       this.consumerQueues.delete(consumerTag);
-      queue.removeConsumer(consumerTag);
+      queue.removeConsumer(consumerTag, this);
       this.broker.autoDeleteIfUnused(queue);
     }
     // Cancelling an unknown consumer succeeds (RabbitMQ behaviour)
@@ -479,7 +491,7 @@ export class Channel {
       return;
     }
     const deliveryTag = ++this.deliveryTagCounter;
-    if (!f.noAck) this.unacked.set(deliveryTag, { message, queue, fromConsumer: false });
+    if (!f.noAck) this.unacked.set(deliveryTag, { message, queue });
     this.send(methods.BasicGetOk, {
       deliveryTag,
       redelivered: message.redelivered,
@@ -494,6 +506,9 @@ export class Channel {
 
   /** Resolve a delivery tag (+multiple) to unacked entries, removing them. */
   private takeUnacked(deliveryTag: number, multiple: boolean): UnackedEntry[] {
+    if ((deliveryTag !== 0 || !multiple) && !this.unacked.has(deliveryTag)) {
+      throw new ChannelError(constants.PRECONDITION_FAILED, `unknown delivery tag ${deliveryTag}`);
+    }
     const taken: UnackedEntry[] = [];
     if (multiple) {
       // tag 0 with multiple means "everything so far"
@@ -504,13 +519,7 @@ export class Channel {
         }
       }
     } else {
-      const entry = this.unacked.get(deliveryTag);
-      if (!entry) {
-        throw new ChannelError(
-          constants.PRECONDITION_FAILED,
-          `unknown delivery tag ${deliveryTag}`,
-        );
-      }
+      const entry = this.unacked.get(deliveryTag)!;
       taken.push(entry);
       this.unacked.delete(deliveryTag);
     }
@@ -579,7 +588,7 @@ export class Channel {
   /** Cancel consumers and requeue unacked messages (channel/connection close). */
   releaseAll(): void {
     for (const [consumerTag, queue] of this.consumerQueues) {
-      queue.removeConsumer(consumerTag);
+      queue.removeConsumer(consumerTag, this);
       this.broker.autoDeleteIfUnused(queue);
     }
     this.consumerQueues.clear();

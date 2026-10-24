@@ -29,6 +29,8 @@ export interface QueueHooks {
  */
 export interface Consumer {
   readonly consumerTag: string;
+  /** Consumer tags are scoped to their channel, not the queue. */
+  readonly owner?: object;
   readonly noAck: boolean;
   readonly exclusive: boolean;
   deliver(message: Message, queue: Queue): boolean;
@@ -50,6 +52,7 @@ export class Queue {
   /** True once a consumer has ever been registered — drives auto-delete. */
   private hadConsumers = false;
 
+  private readonly expiryTimers = new Set<NodeJS.Timeout>();
   private idleTimer: NodeJS.Timeout | undefined;
 
   constructor(
@@ -206,6 +209,8 @@ export class Queue {
 
   /** Cancel timers when the broker removes this queue. */
   dispose(): void {
+    for (const timer of this.expiryTimers) clearTimeout(timer);
+    this.expiryTimers.clear();
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = undefined;
   }
@@ -214,8 +219,7 @@ export class Queue {
   private applyTtl(message: Message): void {
     const queueTtl = this.messageTtl;
     const raw = message.properties.expiration;
-    const perMessage =
-      typeof raw === 'string' && /^\d+$/.test(raw) ? parseInt(raw, 10) : undefined;
+    const perMessage = typeof raw === 'string' && /^\d+$/.test(raw) ? parseInt(raw, 10) : undefined;
     const ttl =
       queueTtl !== undefined && perMessage !== undefined
         ? Math.min(queueTtl, perMessage)
@@ -232,13 +236,18 @@ export class Queue {
    * same reason.
    */
   private scheduleExpiry(message: Message, delayMs: number): void {
-    const timer = setTimeout(() => {
-      const i = this.messages.indexOf(message);
-      if (i !== -1) {
-        this.messages.splice(i, 1);
-        this.deadLetter(this, message, 'expired');
-      }
-    }, Math.max(0, delayMs));
+    const timer = setTimeout(
+      () => {
+        this.expiryTimers.delete(timer);
+        const i = this.messages.indexOf(message);
+        if (i !== -1) {
+          this.messages.splice(i, 1);
+          this.deadLetter(this, message, 'expired');
+        }
+      },
+      Math.max(0, delayMs),
+    );
+    this.expiryTimers.add(timer);
     timer.unref?.();
   }
 
@@ -264,8 +273,8 @@ export class Queue {
   }
 
   /** @returns true if the consumer was registered here. */
-  removeConsumer(consumerTag: string): boolean {
-    const i = this.consumers.findIndex((c) => c.consumerTag === consumerTag);
+  removeConsumer(consumerTag: string, owner?: object): boolean {
+    const i = this.consumers.findIndex((c) => c.consumerTag === consumerTag && c.owner === owner);
     if (i === -1) return false;
     this.consumers.splice(i, 1);
     if (this.rrIndex > i) this.rrIndex--;
