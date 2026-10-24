@@ -195,7 +195,10 @@ describe('exchanges and routing', () => {
     // Routing is deterministic: the same key always lands on the same queue
     channel.publish('hx', 'key-0', Buffer.from('again'));
     await wait(30);
-    expect(server.broker.queues.get('hx-a')!.messageCount + server.broker.queues.get('hx-b')!.messageCount).toBe(51);
+    expect(
+      server.broker.queues.get('hx-a')!.messageCount +
+        server.broker.queues.get('hx-b')!.messageCount,
+    ).toBe(51);
   });
 });
 
@@ -377,8 +380,7 @@ describe('queue limits and lifetimes', () => {
     await channel.bindQueue('cap-dlq', 'cap-x', '');
     await channel.assertQueue('cap', { maxLength: 2, deadLetterExchange: 'cap-x' });
     for (const body of ['a', 'b', 'c']) channel.sendToQueue('cap', Buffer.from(body));
-    await wait(30);
-    expect(server.broker.queues.get('cap')!.messageCount).toBe(2);
+    expect((await channel.checkQueue('cap')).messageCount).toBe(2);
     const dropped = (await channel.get('cap-dlq', { noAck: true })) as ConsumeMessage;
     expect(dropped.content.toString()).toBe('a'); // oldest goes first
     expect(dropped.properties.headers!['x-death']).toMatchObject([
