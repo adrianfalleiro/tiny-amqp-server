@@ -1,27 +1,36 @@
 {
-  "name": "tiny-amqp-server",
+  "name": "@adrianfalleiro/tiny-amqp-server",
   "version": "0.1.0",
   "description": "A small in-memory AMQP 0-9-1 server for tests and local development, built on amqplib's wire-protocol implementation.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adrianfalleiro/tiny-amqp-server.git"
+  },
   "files": [
     "dist"
   ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "tsc && cp src/vendor/amqplib/LICENSE-amqplib src/vendor/amqplib/LICENSE-MIT dist/vendor/amqplib/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "demo": "tsx examples/demo.ts"
+    "demo": "tsx examples/demo.ts",
+    "prepack": "npm run build"
   },
-  "engines": {
-    "node": ">=18"
-  },
-  "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",
     "amqplib": "^2.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
